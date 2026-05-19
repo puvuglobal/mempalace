@@ -28,6 +28,8 @@ from mempalace.hooks_cli import (
     hook_session_start,
     hook_precompact,
     run_hook,
+    _claim_mine_slot,
+    _pid_file_for_cmd,
 )
 
 
@@ -681,6 +683,39 @@ def test_mine_sync_uses_mempalace_python(tmp_path):
                     _mine_sync()
                     cmd = mock_run.call_args[0][0]
                     assert cmd[0] == "/fake/venv/python"
+
+
+def test_claim_mine_slot_writes_live_placeholder_pid(tmp_path):
+    """Regression #1443: claimed slots must not be empty during spawn startup."""
+    cmd = ["mempalace", "mine", "/tmp/proj", "--mode", "projects"]
+    pid_dir = tmp_path / "mine_pids"
+
+    with patch("mempalace.hooks_cli._MINE_PID_DIR", pid_dir):
+        pid_file = _claim_mine_slot(cmd)
+
+        assert pid_file == _pid_file_for_cmd(cmd)
+        assert pid_file.read_text().strip() == str(os.getpid())
+        assert _mine_already_running(cmd) is True
+        assert _claim_mine_slot(cmd) is None
+
+
+def test_claim_mine_slot_reclaimed_slot_writes_live_placeholder_pid(tmp_path):
+    """Regression #1443: stale-slot reclaim must also write a live placeholder."""
+    cmd = ["mempalace", "mine", "/tmp/proj", "--mode", "projects"]
+    pid_dir = tmp_path / "mine_pids"
+
+    with (
+        patch("mempalace.hooks_cli._MINE_PID_DIR", pid_dir),
+        patch("mempalace.hooks_cli._pid_alive", return_value=False),
+    ):
+        pid_file = _pid_file_for_cmd(cmd)
+        pid_file.parent.mkdir(parents=True, exist_ok=True)
+        pid_file.write_text("12345")
+
+        reclaimed = _claim_mine_slot(cmd)
+
+        assert reclaimed == pid_file
+        assert pid_file.read_text().strip() == str(os.getpid())
 
 
 def test_maybe_auto_ingest_ignores_transcript_arg_path(tmp_path):
