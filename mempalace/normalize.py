@@ -523,6 +523,8 @@ def _format_tool_use(block: dict) -> str:
     """Format a tool_use block into a human-readable one-liner."""
     name = block.get("name", "Unknown")
     inp = block.get("input", {})
+    if isinstance(inp, list):
+        inp = {}
 
     if name == "Bash":
         cmd = inp.get("command", "")
