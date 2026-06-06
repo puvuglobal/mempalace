@@ -69,6 +69,43 @@ python -m venv .venv && source .venv/bin/activate
 pip install mempalace
 ```
 
+### Docker
+
+A container image is also available for running the MCP server or the CLI
+without a local Python toolchain. Everything persists under `/data` (palace,
+config, and the cached embedding model), so mount a volume there.
+
+```bash
+# Build the image (CPU; bundles the `extract` + `spellcheck` extras)
+docker build -t mempalace .
+
+# MCP server over stdio — note the `-i` flag (JSON-RPC needs stdin)
+docker run -i --rm -v mempalace-data:/data mempalace
+
+# Run any CLI command instead (mount the host directory you want to mine)
+docker run --rm -v mempalace-data:/data -v /path/to/project:/work mempalace mine /work
+docker run --rm -v mempalace-data:/data mempalace search "why GraphQL"
+```
+
+Wire it into an MCP client (e.g. Claude Code) as a stdio server:
+
+```json
+{
+  "mcpServers": {
+    "mempalace": {
+      "command": "docker",
+      "args": ["run", "-i", "--rm", "-v", "mempalace-data:/data", "mempalace"]
+    }
+  }
+}
+```
+
+`docker compose run --rm mcp` works too (see `docker-compose.yml`). For
+CUDA-accelerated embeddings, build the GPU variant with
+`docker build -f Dockerfile.gpu -t mempalace:gpu .` and run it with
+`--gpus all`. Customise the bundled extras at build time, e.g.
+`docker build --build-arg EXTRAS="extract,spellcheck" -t mempalace .`.
+
 ## Storage backends
 
 ChromaDB is the default. For the pluggable-backend preview, MemPalace also
