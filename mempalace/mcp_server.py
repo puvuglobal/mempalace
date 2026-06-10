@@ -1540,6 +1540,213 @@ def tool_delete_drawer(drawer_id: str):
         return {"success": False, "error": str(e)}
 
 
+def _capture_fd_stdout(fn):
+    """Run ``fn()`` with its stdout captured at both the Python and fd level.
+
+    The mining engines (``miner.mine`` / ``convo_miner.mine_convos`` /
+    ``format_miner.mine_formats``) print progress and a summary to stdout. In
+    the MCP server stdout is the JSON-RPC channel (``_restore_stdout`` runs once
+    in ``main`` before the protocol loop), so that output would corrupt the
+    protocol. Two layers are needed:
+
+    * ``contextlib.redirect_stdout`` captures Python-level ``print`` into a
+      buffer — this is what becomes the returned summary, and it works even when
+      ``sys.stdout`` has been swapped (e.g. under pytest capture).
+    * an ``os.dup2`` of fd 1 to a temp file contains C-level banners emitted by
+      onnxruntime / chromadb during embedding, which bypass ``sys.stdout``
+      entirely (the same reason the module redirects fd 1 at import, #225), and
+      keeps any direct fd-1 write off the live JSON-RPC channel.
+
+    Returns ``(result, captured_text)``. ``captured_text`` is handed back to the
+    caller verbatim as an opaque summary; it is never parsed into fields. Falls
+    back to Python-level capture alone on platforms without fd-level stdio
+    (embedded interpreters), matching the import-time fallback.
+    """
+    import contextlib
+    import io
+    import tempfile
+
+    buf = io.StringIO()
+    sys.stdout.flush()
+    sys.stderr.flush()
+    try:
+        saved_fd = os.dup(1)
+    except (OSError, AttributeError):
+        with contextlib.redirect_stdout(buf):
+            result = fn()
+        return result, buf.getvalue()
+
+    try:
+        with tempfile.TemporaryFile() as tmp:
+            os.dup2(tmp.fileno(), 1)
+            try:
+                with contextlib.redirect_stdout(buf):
+                    result = fn()
+            finally:
+                sys.stdout.flush()
+                os.dup2(saved_fd, 1)
+            tmp.seek(0)
+            fd_text = tmp.read().decode("utf-8", "replace")
+        return result, buf.getvalue() + fd_text
+    finally:
+        os.close(saved_fd)
+
+
+def tool_mine(
+    source: str,
+    mode: str = "projects",
+    wing: str = None,
+    agent: str = "mempalace",
+    limit: int = 0,
+    dry_run: bool = False,
+    extract: str = "exchange",
+):
+    """Mine a directory into the palace — the MCP equivalent of ``mempalace mine``.
+
+    Lets MCP clients that cannot shell out (Claude Desktop, LM Studio, Aionui,
+    Desktop Commander) trigger indexing in-conversation (#1662). Wraps the same
+    in-process miners the CLI's ``cmd_mine`` calls; it adds no new ingestion
+    logic of its own.
+
+    mode:
+        ``"projects"`` (default) — code/docs via ``miner.mine``.
+        ``"convos"``             — chat transcripts via ``convo_miner.mine_convos``.
+        ``"extract"``            — office documents (PDF/DOCX/RTF/…) via
+                                   ``format_miner.mine_formats``; requires the
+                                   optional ``mempalace[extract]`` dependency.
+    wing:    target wing (default: derived from the source directory name).
+    agent:   recorded on every drawer (default ``"mempalace"``).
+    limit:   max files to process (0 = all).
+    dry_run: walk + chunk and report, but file nothing.
+    extract: convos extraction strategy — ``"exchange"`` (default) or
+             ``"general"``; ignored by the other modes.
+
+    Runs synchronously and mirrors the :func:`tool_sync` contract: success
+    returns ``{success: True, mode, dry_run, output[, output_truncated]}`` where ``output`` is
+    the miner's human-readable summary (captured so it cannot corrupt the
+    JSON-RPC stream); failure returns ``{success: False, error[, error_class]}``.
+    The palace write lock is held by the miners themselves, so a concurrent mine
+    surfaces as a structured already-running error. Orphan cleanup is not part of
+    mining — use ``mempalace_sync`` for that.
+    """
+    global _metadata_cache
+    from .palace import MineAlreadyRunning, MineValidationError
+
+    if not _config.palace_path:
+        np = _no_palace()
+        return {"success": False, "error": np.get("error", "no palace"), "hint": np.get("hint")}
+
+    valid_modes = ("projects", "convos", "extract")
+    if mode not in valid_modes:
+        return {
+            "success": False,
+            "error": f"invalid mode '{mode}'; expected one of: {', '.join(valid_modes)}",
+        }
+
+    src = os.path.expanduser(source) if source else ""
+    if not src or not os.path.isdir(src):
+        return {"success": False, "error": f"source directory not found: {source!r}"}
+
+    def _run():
+        if mode == "convos":
+            from .convo_miner import mine_convos
+
+            return mine_convos(
+                convo_dir=src,
+                palace_path=_config.palace_path,
+                wing=wing,
+                agent=agent,
+                limit=limit,
+                dry_run=dry_run,
+                extract_mode=extract,
+            )
+        if mode == "extract":
+            from .format_miner import mine_formats
+
+            return mine_formats(
+                format_dir=src,
+                palace_path=_config.palace_path,
+                wing=wing,
+                agent=agent,
+                limit=limit,
+                dry_run=dry_run,
+            )
+        from .miner import mine
+
+        return mine(
+            project_dir=src,
+            palace_path=_config.palace_path,
+            wing_override=wing,
+            agent=agent,
+            limit=limit,
+            dry_run=dry_run,
+        )
+
+    try:
+        try:
+            _result, output = _capture_fd_stdout(_run)
+        # Order matters: typed handlers precede the bare Exception (mirroring
+        # tool_sync) so MineAlreadyRunning / MineValidationError / ValueError
+        # don't fall into the generic "mine failed" branch.
+        except MineAlreadyRunning as exc:
+            return {
+                "success": False,
+                "error": f"another mine is in progress: {exc}",
+                "error_class": "LockHeldByOtherProcess",
+            }
+        except MineValidationError as exc:
+            return {
+                "success": False,
+                "error": f"palace integrity check failed after mine: {exc}",
+                "error_class": "MineValidationError",
+            }
+        except ImportError as exc:
+            # 'extract' mode pulls in the optional mempalace[extract] stack;
+            # name it so the caller knows to install the extra. Other modes have
+            # no optional imports, so an ImportError there is a real bug, not a
+            # missing extra — log the traceback and surface its type.
+            if mode == "extract":
+                return {
+                    "success": False,
+                    "error": f"mode 'extract' needs the mempalace[extract] extra: {exc}",
+                    "error_class": "MissingDependency",
+                }
+            logger.exception("tool_mine: unexpected ImportError (mode=%s)", mode)
+            return {"success": False, "error": f"mine failed: {exc}", "error_class": "ImportError"}
+        except ValueError as exc:
+            return {"success": False, "error": str(exc), "error_class": "ValueError"}
+        except SystemExit as exc:
+            # A library mine() must never terminate the MCP server. miner.mine
+            # converts Ctrl-C into sys.exit(130) (CLI semantics); in-process
+            # that SystemExit is a BaseException that would slip past the
+            # protocol loop's `except Exception` and kill the server with no
+            # response. Convert it to a structured error instead.
+            return {
+                "success": False,
+                "error": f"mine exited early (code {exc.code})",
+                "error_class": "Interrupted",
+            }
+        except Exception as exc:
+            logger.exception("tool_mine: mine failed (mode=%s)", mode)
+            return {
+                "success": False,
+                "error": f"mine failed: {exc}",
+                "error_class": type(exc).__name__,
+            }
+        # Cap the echoed summary so a very large mine cannot return a multi-MB
+        # payload to the MCP client. The useful summary is at the tail, so keep
+        # the end and flag the truncation (never silently).
+        payload = {"success": True, "mode": mode, "dry_run": dry_run, "output": output}
+        cap = 4000
+        if len(output) > cap:
+            payload["output"] = output[-cap:]
+            payload["output_truncated"] = True
+        return payload
+    finally:
+        if not dry_run:
+            _metadata_cache = None
+
+
 def tool_sync(project_dir: str = None, wing: str = None, apply: bool = False):
     """Prune drawers whose source files are gitignored, missing, or moved (#1252)."""
     global _metadata_cache
@@ -2566,6 +2773,60 @@ TOOLS = {
             "required": ["drawer_id"],
         },
         "handler": tool_delete_drawer,
+    },
+    "mempalace_mine": {
+        "description": (
+            "Mine a directory into the palace — the MCP equivalent of `mempalace mine`. "
+            "mode='projects' (default) ingests code/docs; mode='convos' ingests chat "
+            "transcripts; mode='extract' ingests office documents (PDF/DOCX/RTF, requires "
+            "the mempalace[extract] extra). Runs synchronously and returns the miner's "
+            "summary as `output`. The palace write lock is automatic; a concurrent mine "
+            "returns a structured already-running error. Orphan cleanup is separate — use "
+            "mempalace_sync."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "source": {
+                    "type": "string",
+                    "description": "Directory to mine.",
+                },
+                "mode": {
+                    "type": "string",
+                    "enum": ["projects", "convos", "extract"],
+                    "description": (
+                        "Ingest mode: projects (code/docs, default), convos (chat "
+                        "transcripts), extract (office docs)."
+                    ),
+                },
+                "wing": {
+                    "type": "string",
+                    "description": "Target wing (default: source directory name).",
+                },
+                "agent": {
+                    "type": "string",
+                    "description": "Recorded on every drawer (default: mempalace).",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Max files to process (0 = all). Default: 0.",
+                },
+                "dry_run": {
+                    "type": "boolean",
+                    "description": "Report what would be filed without writing. Default: false.",
+                },
+                "extract": {
+                    "type": "string",
+                    "enum": ["exchange", "general"],
+                    "description": (
+                        "Convos extraction strategy: exchange (default) or general. "
+                        "Ignored by other modes."
+                    ),
+                },
+            },
+            "required": ["source"],
+        },
+        "handler": tool_mine,
     },
     "mempalace_sync": {
         "description": "Prune drawers whose source files are gitignored, deleted, or moved. Returns dry-run report by default; pass apply=true to commit deletions.",
