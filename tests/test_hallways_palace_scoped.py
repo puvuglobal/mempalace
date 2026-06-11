@@ -132,8 +132,13 @@ class TestMultiPalaceIsolation:
         palace_a.mkdir(parents=True)
         palace_b.mkdir(parents=True)
 
-        # Force the module constant to match the (default) legacy path so the
-        # back-compat shim doesn't override the resolver.
+        # Pin the legacy-file lookup to a temp path so the legacy-warning
+        # branch never checks the host's real ~/.mempalace/hallways.json.
+        monkeypatch.setattr(
+            hallways_mod,
+            "_legacy_hallway_file",
+            lambda: str(tmp_path / "legacy-hallways.json"),
+        )
 
         monkeypatch.setenv("MEMPALACE_PALACE_PATH", str(palace_a))
         hallways_mod._save_hallways(
