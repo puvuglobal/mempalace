@@ -465,11 +465,10 @@ class _PgVectorClient:
     def __init__(self, config: _PgVectorConfig):
         self._config = config
         self._conn = None
+        self._closed = False
         self._lock = threading.RLock()
 
     def _connect(self):
-        if self._conn is not None and not getattr(self._conn, "closed", False):
-            return self._conn
         try:
             import psycopg
         except ImportError as exc:  # pragma: no cover - exercised only without the extra
@@ -477,15 +476,27 @@ class _PgVectorClient:
                 "pgvector backend requires the optional 'psycopg' dependency; "
                 "install mempalace[pgvector]"
             ) from exc
-        try:
-            self._conn = psycopg.connect(self._config.dsn)
-        except Exception as exc:  # noqa: BLE001 - surface any driver failure uniformly
-            raise BackendError(f"pgvector connection failed: {exc}") from exc
-        return self._conn
+        # One client is shared across threads (PgVectorBackend caches a
+        # single instance per config), so the read-create-store on self._conn
+        # must hold the same lock _execute serializes on; unlocked, two
+        # first-connect threads each opened a connection and the loser leaked
+        # unclosed. The RLock makes the _execute -> _connect nesting safe. A
+        # stalled connect blocks peers under the lock the same way any
+        # in-flight query on this single shared connection already does.
+        with self._lock:
+            if self._closed:
+                raise BackendError("pgvector client has been closed")
+            if self._conn is not None and not getattr(self._conn, "closed", False):
+                return self._conn
+            try:
+                self._conn = psycopg.connect(self._config.dsn)
+            except Exception as exc:  # noqa: BLE001 - surface any driver failure uniformly
+                raise BackendError(f"pgvector connection failed: {exc}") from exc
+            return self._conn
 
     def _execute(self, sql: str, params=None, *, fetch: bool = False, many: bool = False):
-        conn = self._connect()
         with self._lock:
+            conn = self._connect()
             try:
                 with conn.cursor() as cur:
                     if many:
@@ -684,7 +695,12 @@ class _PgVectorClient:
         self._execute(f"ANALYZE {_quote_identifier(table)}")
 
     def close(self) -> None:
+        # Terminal: the only caller is PgVectorBackend.close(), after which
+        # the backend refuses to hand the client out again. Without the flag a
+        # stale reference would silently reconnect and leak a session nobody
+        # can ever close.
         with self._lock:
+            self._closed = True
             if self._conn is not None:
                 try:
                     self._conn.close()
@@ -1285,9 +1301,12 @@ class PgVectorBackend(BaseBackend):
 
     # ------------------------------------------------------------------
     def _client(self, config: _PgVectorConfig) -> _PgVectorClient:
-        if self._closed:
-            raise BackendClosedError("PgVectorBackend has been closed")
         with self._lock:
+            # Checked under the lock so a client cannot be created and stored
+            # concurrently with close() clearing the registry (mirrors
+            # SQLiteExactBackend._connect).
+            if self._closed:
+                raise BackendClosedError("PgVectorBackend has been closed")
             client = self._clients.get(config)
             if client is None:
                 client = _PgVectorClient(config)

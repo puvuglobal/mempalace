@@ -836,19 +836,31 @@ class SQLiteExactBackend(BaseBackend):
                 os.chmod(palace_path, 0o700)
             except (OSError, NotImplementedError):
                 pass
+        # Hold the registry lock across cache-check + connect + schema init:
+        # two threads first-opening the same palace must not each create a
+        # connection (the loser leaked unclosed and outlived close()) nor run
+        # _init_schema concurrently on a fresh file, which surfaces transient
+        # "database is locked" errors before WAL mode is established. Only
+        # first-open pays for the I/O under the lock; cache hits are a dict
+        # probe.
         with self._clients_lock:
+            if self._closed:
+                raise BackendClosedError("SQLiteExactBackend has been closed")
             cached = self._clients.get(palace_path)
             if cached is not None and not cached.closed:
                 return cached
-        conn = sqlite3.connect(db_path, check_same_thread=False)
-        conn.row_factory = sqlite3.Row
-        lock = threading.RLock()
-        handle = _SQLiteExactHandle(conn, lock)
-        with handle.lock:
-            self._init_schema(conn)
-        with self._clients_lock:
+            conn = sqlite3.connect(db_path, check_same_thread=False)
+            try:
+                conn.row_factory = sqlite3.Row
+                lock = threading.RLock()
+                handle = _SQLiteExactHandle(conn, lock)
+                with handle.lock:
+                    self._init_schema(conn)
+            except BaseException:
+                conn.close()
+                raise
             self._clients[palace_path] = handle
-        return handle
+            return handle
 
     def _init_schema(self, conn: sqlite3.Connection) -> None:
         conn.executescript(
@@ -979,14 +991,19 @@ class SQLiteExactBackend(BaseBackend):
                 cached.conn.close()
 
     def close(self) -> None:
+        # Flip _closed under the registry lock so a concurrent _connect either
+        # sees the flag or finishes before the handle snapshot is taken; a
+        # connection can no longer slip into the registry after close().
+        # Unlocked readers of _closed elsewhere are advisory fast-fails; the
+        # locked recheck in _connect is the authoritative gate.
         with self._clients_lock:
             handles = list(self._clients.values())
             self._clients.clear()
+            self._closed = True
         for handle in handles:
             with handle.lock:
                 handle.closed = True
                 handle.conn.close()
-        self._closed = True
 
     def health(self, palace: Optional[PalaceRef] = None) -> HealthStatus:
         if self._closed:
