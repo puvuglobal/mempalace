@@ -4,6 +4,14 @@ import threading
 import time
 import urllib.error
 import urllib.request
+
+_HTTP_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+def _urlopen(request, timeout):
+    return _HTTP_OPENER.open(request, timeout=timeout)
+
+
 from typing import Optional
 
 import pytest
@@ -78,7 +86,7 @@ def http_port():
 
     while time.monotonic() < deadline:
         try:
-            with urllib.request.urlopen(url, timeout=1) as resp:
+            with _urlopen(url, timeout=1) as resp:
                 body = resp.read().decode("utf-8")
             if resp.status == 200 and body == "ok\n":
                 break
@@ -109,7 +117,7 @@ def _rpc(port: int, method: str, params: Optional[dict] = None, req_id: int = 1)
         headers={"Content-Type": "application/json"},
         method="POST",
     )
-    with urllib.request.urlopen(request, timeout=10) as resp:
+    with _urlopen(request, timeout=10) as resp:
         body = resp.read().decode("utf-8")
         return resp.status, json.loads(body) if body else None
 
@@ -146,7 +154,7 @@ def test_parse_args_accepts_http_transport(monkeypatch):
 
 
 def test_http_transport_serves_healthz(http_port):
-    with urllib.request.urlopen(f"http://127.0.0.1:{http_port}/healthz", timeout=10) as resp:
+    with _urlopen(f"http://127.0.0.1:{http_port}/healthz", timeout=10) as resp:
         body = resp.read().decode("utf-8")
 
     assert resp.status == 200
@@ -191,7 +199,7 @@ def test_http_transport_returns_parse_error_for_invalid_json(http_port):
     )
 
     with pytest.raises(urllib.error.HTTPError) as excinfo:
-        urllib.request.urlopen(request, timeout=10)
+        _urlopen(request, timeout=10)
 
     body = excinfo.value.read().decode("utf-8")
     payload = json.loads(body)
@@ -214,7 +222,7 @@ def test_http_transport_accepts_notifications_without_body(http_port):
         method="POST",
     )
 
-    with urllib.request.urlopen(request, timeout=10) as resp:
+    with _urlopen(request, timeout=10) as resp:
         body = resp.read()
 
     assert resp.status == 202
@@ -230,6 +238,6 @@ def test_http_transport_returns_404_for_unknown_path(http_port):
     )
 
     with pytest.raises(urllib.error.HTTPError) as excinfo:
-        urllib.request.urlopen(request, timeout=10)
+        _urlopen(request, timeout=10)
 
     assert excinfo.value.code == 404
