@@ -537,6 +537,20 @@ class TestHandleRequest:
         assert "mempalace_add_drawer" in names
         assert "mempalace_kg_add" in names
 
+    def test_no_tool_schema_uses_top_level_combinator(self):
+        """Anthropic's Messages API rejects a tool whose input schema has a
+        top-level anyOf/oneOf/allOf and drops the entire tools array with a
+        400, killing the session (#1711). Cross-tool constraints must be
+        enforced at dispatch instead.
+        """
+        from mempalace.mcp_server import handle_request
+
+        resp = handle_request({"method": "tools/list", "id": 2, "params": {}})
+        for tool in resp["result"]["tools"]:
+            schema = tool["inputSchema"]
+            for keyword in ("anyOf", "oneOf", "allOf"):
+                assert keyword not in schema, f"{tool['name']} schema has top-level {keyword}"
+
     def test_null_arguments_does_not_hang(self, monkeypatch, config, palace_path, seeded_kg):
         """Sending arguments: null should return a result, not hang (#394)."""
         _patch_mcp_server(monkeypatch, config, seeded_kg)

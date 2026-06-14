@@ -3229,13 +3229,10 @@ TOOLS = {
                     "description": "Alias for 'entry' — accepted because add_drawer uses 'content'. Provide either 'entry' or 'content'; 'entry' wins if both are given.",
                 },
             },
-            # agent_name is always required; 'entry' or its alias 'content' must
-            # be present (the server remaps content->entry at dispatch).
+            # 'entry' (or its alias 'content') is enforced at dispatch, not via a
+            # top-level anyOf: Anthropic rejects schemas with a top-level
+            # anyOf/oneOf/allOf and drops the whole tools array (400).
             "required": ["agent_name"],
-            "anyOf": [
-                {"required": ["entry"]},
-                {"required": ["content"]},
-            ],
         },
         "handler": tool_diary_write,
     },
