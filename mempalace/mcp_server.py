@@ -4565,6 +4565,11 @@ def _json_rpc_parse_error(req_id=None):
 # Module-level lock and limit used by the HTTP transport.
 # Must be at module scope so _serve_http() and any future HTTP helpers
 # can reference them without a closure or import.
+
+
+# Module-level constants for the HTTP transport.
+# Defined here (not inside main()) so _serve_http() and _run_http_loop()
+# can reference them as free names without a NameError.
 _HTTP_REQUEST_LOCK = threading.Lock()
 _HTTP_MAX_REQUEST_BYTES = 16 * 1024 * 1024
 
