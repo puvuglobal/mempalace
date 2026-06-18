@@ -3834,3 +3834,85 @@ class TestUnknownParamName:
         )
         assert "error" not in resp
         assert "result" in resp
+
+
+def test_peer_writer_guard_refuses_mutating_tool_before_handler(monkeypatch):
+    from mempalace import mcp_server
+
+    called = {"value": False}
+
+    def handler(**kwargs):
+        called["value"] = True
+        return {"ok": True}
+
+    monkeypatch.setitem(
+        mcp_server.TOOLS,
+        "mempalace_add_drawer",
+        {
+            "description": "test write tool",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "wing": {"type": "string"},
+                    "room": {"type": "string"},
+                    "content": {"type": "string"},
+                },
+            },
+            "handler": handler,
+        },
+    )
+    monkeypatch.setattr(
+        mcp_server,
+        "_acquire_mcp_writer_lock",
+        lambda: (False, "busy writer"),
+    )
+
+    response = mcp_server.handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "tools/call",
+            "params": {
+                "name": "mempalace_add_drawer",
+                "arguments": {
+                    "wing": "wing_test",
+                    "room": "room_test",
+                    "content": "hello",
+                },
+            },
+        }
+    )
+
+    assert called["value"] is False
+    assert response["error"]["code"] == -32001
+    assert "read-only" in response["error"]["message"]
+    assert response["error"]["data"]["tool"] == "mempalace_add_drawer"
+
+
+def test_peer_writer_guard_does_not_gate_read_tool(monkeypatch):
+    from mempalace import mcp_server
+
+    def forbidden_lock():
+        raise AssertionError("read tools should not acquire the peer-writer lock")
+
+    monkeypatch.setitem(
+        mcp_server.TOOLS,
+        "mempalace_status",
+        {
+            "description": "test read tool",
+            "input_schema": {"type": "object", "properties": {}},
+            "handler": lambda: {"ok": True},
+        },
+    )
+    monkeypatch.setattr(mcp_server, "_acquire_mcp_writer_lock", forbidden_lock)
+
+    response = mcp_server.handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 8,
+            "method": "tools/call",
+            "params": {"name": "mempalace_status", "arguments": {}},
+        }
+    )
+
+    assert '"ok": true' in response["result"]["content"][0]["text"]

@@ -224,6 +224,109 @@ _MCP_IDLE_HOURS_ENV = "MEMPALACE_MCP_IDLE_HOURS"
 _MCP_IDLE_HOURS_DEFAULT = 8.0
 _last_request_time: float = time.monotonic()
 
+# MCP peer-writer guard (#1818).
+#
+# The existing per-operation palace lock serializes individual writes, but it
+# cannot make another long-lived Chroma PersistentClient forget stale in-memory
+# HNSW/FTS state. Hold the same per-palace mine lock for this MCP process
+# lifetime. A peer MCP process can still serve read tools, but mutating tools
+# refuse before touching Chroma or the knowledge graph.
+_MCP_WRITER_LOCK_CM = None
+_MCP_WRITER_READ_ONLY = False
+_MCP_WRITER_LOCK_ERROR = ""
+_MCP_ALLOW_PEER_WRITER_ENV = "MEMPALACE_MCP_ALLOW_PEER_WRITER"
+
+_MUTATING_TOOLS = frozenset(
+    {
+        "mempalace_kg_add",
+        "mempalace_kg_invalidate",
+        "mempalace_create_tunnel",
+        "mempalace_delete_tunnel",
+        "mempalace_delete_hallway",
+        "mempalace_add_drawer",
+        "mempalace_delete_drawer",
+        "mempalace_mine",
+        "mempalace_sync",
+        "mempalace_update_drawer",
+        "mempalace_diary_write",
+    }
+)
+
+
+def _truthy_env(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _acquire_mcp_writer_lock() -> tuple[bool, str]:
+    """Acquire this process's per-palace MCP writer lease.
+
+    Returns (True, "") when this process may write. Returns (False, reason)
+    when another live writer already owns the per-palace lease. Once a server
+    starts read-only it stays read-only for its lifetime; restarting is the
+    safe way to become the writer after the original holder exits.
+    """
+
+    global _MCP_WRITER_LOCK_CM, _MCP_WRITER_READ_ONLY, _MCP_WRITER_LOCK_ERROR
+
+    if _truthy_env(_MCP_ALLOW_PEER_WRITER_ENV):
+        return True, ""
+
+    if _MCP_WRITER_LOCK_CM is not None:
+        return True, ""
+
+    if _MCP_WRITER_READ_ONLY:
+        return False, _MCP_WRITER_LOCK_ERROR
+
+    try:
+        from .palace import MineAlreadyRunning, mine_palace_lock
+
+        lock_cm = mine_palace_lock(_config.palace_path)
+        lock_cm.__enter__()
+    except MineAlreadyRunning as exc:
+        _MCP_WRITER_READ_ONLY = True
+        _MCP_WRITER_LOCK_ERROR = (
+            "another mempalace writer already holds the palace lock for "
+            f"{_config.palace_path!r}: {exc}"
+        )
+        return False, _MCP_WRITER_LOCK_ERROR
+    except Exception as exc:
+        _MCP_WRITER_LOCK_ERROR = (
+            "could not acquire MCP peer-writer lock for "
+            f"{_config.palace_path!r}: {exc!r}; continuing without "
+            "peer-writer protection"
+        )
+        logger.warning(_MCP_WRITER_LOCK_ERROR)
+        return True, _MCP_WRITER_LOCK_ERROR
+
+    _MCP_WRITER_LOCK_CM = lock_cm
+    _MCP_WRITER_READ_ONLY = False
+    _MCP_WRITER_LOCK_ERROR = ""
+    return True, ""
+
+
+def _mcp_peer_writer_refusal(req_id, tool_name: str):
+    if tool_name not in _MUTATING_TOOLS:
+        return None
+
+    ok, reason = _acquire_mcp_writer_lock()
+    if ok:
+        return None
+
+    return {
+        "jsonrpc": "2.0",
+        "id": req_id,
+        "error": {
+            "code": -32001,
+            "message": "Peer MCP writer active; this server is read-only for mutating tools",
+            "data": {
+                "tool": tool_name,
+                "palace": _config.palace_path,
+                "reason": reason,
+                "override_env": _MCP_ALLOW_PEER_WRITER_ENV,
+            },
+        },
+    }
+
 
 def _mcp_idle_timeout_secs() -> float:
     """Return the configured MCP idle timeout in seconds (0 = disabled)."""
@@ -1051,6 +1154,9 @@ def tool_status():
     # is detected so status stays reachable.
     db_exists = _backend_db_exists()
     _refresh_vector_disabled_flag()
+    writer_ok, writer_reason = _acquire_mcp_writer_lock()
+    if not writer_ok:
+        logger.warning("%s; mutating MCP tools will run read-only", writer_reason)
 
     if _vector_disabled:
         return _tool_status_via_sqlite()
@@ -3483,6 +3589,10 @@ def handle_request(request):
                     "error": {"code": -32602, "message": f"Invalid value for parameter '{key}'"},
                 }
         tool_args.pop("wait_for_previous", None)
+        peer_writer_error = _mcp_peer_writer_refusal(req_id, tool_name)
+        if peer_writer_error is not None:
+            return peer_writer_error
+
         # 'content' is an accepted alias for diary_write's 'entry' (callers often
         # reuse add_drawer's 'content' name). Map it in here, before dispatch, so a
         # content-only call still satisfies the required 'entry' param while the
