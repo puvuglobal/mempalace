@@ -1995,3 +1995,26 @@ def test_rebuild_index_calls_vacuum(mock_backend_cls, mock_shutil, tmp_path):
         args, kwargs = mock_vacuum.call_args
         assert args[0] == str(tmp_path)
         assert "progress" in kwargs
+
+
+def test_rebuild_from_sqlite_preserves_knowledge_graph_sidecar(tmp_path):
+    """The from-sqlite repair path must not drop the KG SQLite sidecar."""
+    src = tmp_path / "source"
+    dest = tmp_path / "dest"
+    src.mkdir()
+    dest.mkdir()
+
+    (src / "knowledge_graph.sqlite3").write_text("kg-db", encoding="utf-8")
+    (src / "knowledge_graph.sqlite3-wal").write_text("kg-wal", encoding="utf-8")
+    (src / "knowledge_graph.sqlite3-shm").write_text("kg-shm", encoding="utf-8")
+
+    copied = repair._preserve_knowledge_graph_sqlite(str(src), str(dest))
+
+    assert copied == [
+        "knowledge_graph.sqlite3",
+        "knowledge_graph.sqlite3-wal",
+        "knowledge_graph.sqlite3-shm",
+    ]
+    assert (dest / "knowledge_graph.sqlite3").read_text(encoding="utf-8") == "kg-db"
+    assert (dest / "knowledge_graph.sqlite3-wal").read_text(encoding="utf-8") == "kg-wal"
+    assert (dest / "knowledge_graph.sqlite3-shm").read_text(encoding="utf-8") == "kg-shm"

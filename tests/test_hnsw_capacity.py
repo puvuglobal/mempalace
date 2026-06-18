@@ -11,6 +11,7 @@ from __future__ import annotations
 import os
 import pickle
 import sqlite3
+import time
 
 import pytest
 
@@ -640,3 +641,39 @@ def test_tool_status_via_sqlite_returns_breakdown(palace_with_drawers, monkeypat
     # ops×2 (incident + repair runbook), design×1 (metaphor).
     assert out["wings"].get("ops") == 2
     assert out["wings"].get("design") == 1
+
+
+def test_capacity_status_flags_small_gap_with_explicit_low_sync_threshold(tmp_path):
+    """New palaces use a low explicit sync threshold, so 57 missing rows is unsafe."""
+    seg = "seg-1816-explicit-low-sync"
+    _seed_chroma_db(str(tmp_path), sqlite_count=1768, segment_id=seg, sync_threshold=2)
+    _write_pickle(str(tmp_path), seg, hnsw_count=1711)
+
+    info = hnsw_capacity_status(str(tmp_path), COLLECTION)
+
+    assert info["divergence"] == 57
+    assert info["threshold"] == 4
+    assert info["status"] == "diverged"
+    assert info["diverged"] is True
+    assert "repair" in info["message"].lower()
+
+
+def test_capacity_status_flags_stale_below_floor_divergence(tmp_path):
+    """A persistent below-floor sqlite>HNSW gap must not be treated as fresh lag."""
+    from mempalace.backends import chroma
+
+    seg = "seg-1816-stale-below-floor"
+    _seed_chroma_db(str(tmp_path), sqlite_count=1768, segment_id=seg)
+    _write_pickle(str(tmp_path), seg, hnsw_count=1711)
+
+    pickle_path = tmp_path / seg / "index_metadata.pickle"
+    old = time.time() - chroma._HNSW_PERSISTENT_DIVERGENCE_GRACE_SECONDS - 10
+    os.utime(pickle_path, (old, old))
+
+    info = hnsw_capacity_status(str(tmp_path), COLLECTION)
+
+    assert info["divergence"] == 57
+    assert info["threshold"] >= 2000
+    assert info["status"] == "diverged"
+    assert info["diverged"] is True
+    assert "persisted below" in info["message"]
