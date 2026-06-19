@@ -1,3 +1,4 @@
+import os
 import threading
 import time
 
@@ -5,6 +6,37 @@ import pytest
 
 from mempalace import daemon
 from mempalace import service
+
+# Env keys run_server mutates from its background thread, plus umask. If a
+# lifecycle test times out before the server comes up, run_server's finally
+# never runs and those mutations leak into the rest of the suite — every later
+# test that reads MempalaceConfig().palace_path sees a stale deleted tmp path and
+# fails (the 60+ test cascade seen on slow CI runners). The fixtures below force a
+# clean baseline around every daemon test so a leaked thread can't poison the
+# process for tests/test_mcp_server.py and friends (which have no such guard).
+_LEAK_ENV_KEYS = ("MEMPALACE_PALACE_PATH", "MEMPALACE_BACKEND", "MEMPALACE_BACKEND_EXPLICIT")
+
+
+@pytest.fixture(scope="module")
+def _clean_env_snapshot():
+    """Capture the true pre-suite values once, before any daemon test runs."""
+    return {key: os.environ.get(key) for key in _LEAK_ENV_KEYS}
+
+
+@pytest.fixture(autouse=True)
+def _isolate_process_global_state(_clean_env_snapshot):
+    """Restore the process-global env + umask to the pre-suite baseline after every
+    daemon test, even if a leaked run_server thread is still holding them mutated.
+    """
+    prev_umask = os.umask(0o022)
+    os.umask(prev_umask)  # read current umask without changing it
+    yield
+    for key, value in _clean_env_snapshot.items():
+        if value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = value
+    os.umask(prev_umask)
 
 
 def _raise_not_ready(*a, **kw):
@@ -85,7 +117,12 @@ def test_daemon_http_lifecycle_executes_job(tmp_path, monkeypatch):
     thread.start()
 
     client = None
-    deadline = time.monotonic() + 10
+    # 30s: localhost bind is sub-second locally, but contended CI runners (notably
+    # the macOS GitHub Actions fleet) can take several seconds to bring the server
+    # up. A too-tight deadline here makes the test flake AND, because the server
+    # thread never shuts down on timeout, leaks env/umask into the rest of the
+    # suite (guarded by the _isolate_process_global_state fixture above).
+    deadline = time.monotonic() + 30
     while time.monotonic() < deadline:
         client = daemon.get_client_if_running(str(palace))
         if client is not None:
@@ -169,7 +206,7 @@ def _start_server(tmp_path, monkeypatch, execute_fn):
     )
     thread.start()
     client = None
-    deadline = time.monotonic() + 10
+    deadline = time.monotonic() + 30
     while time.monotonic() < deadline:
         client = daemon.get_client_if_running(str(palace))
         if client is not None:
@@ -455,3 +492,176 @@ def test_start_daemon_kills_orphan_on_readiness_timeout(tmp_path, monkeypatch):
     with pytest.raises(daemon.DaemonError):
         daemon.start_daemon(str(palace), timeout=0.05)
     assert fake.killed is True
+
+
+# --- service.run_* happy-path coverage ---
+# These close the draft PR's follow-up ("Add focused happy-path tests for
+# service.run_mine / run_diary_write / run_mcp_tool") and, now that the daemon
+# tests complete reliably, keep service.py's coverage above the CI gate. The
+# capsys-using tests come first; the two that import mempalace.mcp_server (which
+# rebinds sys.stdout) come last and do not use capsys, so the rebind can't break
+# capture in this file or later files (capsys activates after the rebind).
+
+
+def test_print_job_result_replays_stdout_stderr_and_returns_exit_code(capsys):
+    from mempalace import service
+
+    code = service.print_job_result(
+        {"success": False, "error": "boom", "stdout": "out\n", "stderr": "err\n", "exit_code": 3}
+    )
+    assert code == 3
+    captured = capsys.readouterr()
+    assert "out" in captured.out
+    assert "err" in captured.err
+
+
+def test_print_job_result_prints_error_to_stderr_when_no_stderr(capsys):
+    from mempalace import service
+
+    code = service.print_job_result({"success": False, "error": "boom", "exit_code": 1})
+    assert code == 1
+    captured = capsys.readouterr()
+    assert "mempalace: boom" in captured.err
+
+
+def test_run_sync_returns_success_when_palace_dir_missing(tmp_path):
+    from mempalace import service
+
+    result = service.run_sync({"palace_path": str(tmp_path / "nope"), "dry_run": True})
+    assert result["success"] is True
+    assert result["exit_code"] == 0
+
+
+def test_run_sync_returns_success_when_palace_has_no_backend_artifact(tmp_path):
+    from mempalace import service
+
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    result = service.run_sync({"palace_path": str(palace), "dry_run": True})
+    assert result["success"] is True
+    assert result["exit_code"] == 0
+
+
+def test_run_mine_invalid_mode_returns_structured_error(tmp_path):
+    from mempalace import service
+
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    out = service.run_mine({"palace_path": str(palace), "mode": "bogus"})
+    assert out["success"] is False
+    assert "invalid mine mode" in out["error"]
+    assert out["exit_code"] == 2
+
+
+def test_run_mcp_tool_rejects_non_dict_arguments():
+    from mempalace import service
+
+    out = service.run_mcp_tool({"name": "mempalace_add_drawer", "arguments": "nope"})
+    assert out["success"] is False
+    assert "must be an object" in out["error"]
+    assert out["exit_code"] == 2
+
+
+def test_run_mcp_tool_dispatches_write_tool(monkeypatch):
+    import mempalace.mcp_server as mcp
+    from mempalace import service
+
+    captured = {}
+
+    def fake_handler(**arguments):
+        captured["arguments"] = arguments
+        return {"success": True, "written": True}
+
+    monkeypatch.setattr(mcp, "TOOLS", {"mempalace_add_drawer": {"handler": fake_handler}})
+    out = service.run_mcp_tool({"name": "mempalace_add_drawer", "arguments": {"x": 1}})
+    assert out["success"] is True
+    assert out["written"] is True
+    assert out["exit_code"] == 0
+    assert captured["arguments"] == {"x": 1}
+
+
+def test_run_diary_write_forwards_args_and_sets_exit_code(monkeypatch):
+    import mempalace.mcp_server as mcp
+    from mempalace import service
+
+    captured = {}
+
+    def fake_diary(agent_name, entry, topic, wing):
+        captured.update(agent_name=agent_name, entry=entry, topic=topic, wing=wing)
+        return {"success": True}
+
+    monkeypatch.setattr(mcp, "tool_diary_write", fake_diary)
+    out = service.run_diary_write(
+        {"agent_name": "alice", "entry": "hello", "topic": "t", "wing": "w"}
+    )
+    assert out["success"] is True
+    assert out["exit_code"] == 0
+    assert captured == {"agent_name": "alice", "entry": "hello", "topic": "t", "wing": "w"}
+
+
+def test_run_mine_applies_backend_before_mode_validation(tmp_path):
+    """Covers _apply_backend (env set + get_backend_class validation) on the daemon
+    path; the invalid mode short-circuits before any mining runs."""
+    from mempalace import service
+
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    out = service.run_mine({"palace_path": str(palace), "mode": "bogus", "backend": "chroma"})
+    assert out["success"] is False
+    assert out["exit_code"] == 2
+
+
+def test_execute_job_dispatches_diary_write_mcp_tool_and_unknown(monkeypatch):
+    """Covers execute_job's kind dispatch for diary_write, mcp_tool, and the
+    unknown-kind fallback."""
+    import mempalace.mcp_server as mcp
+    from mempalace import service
+
+    monkeypatch.setattr(mcp, "tool_diary_write", lambda **kw: {"success": True})
+    monkeypatch.setattr(
+        mcp, "TOOLS", {"mempalace_add_drawer": {"handler": lambda **kw: {"success": True}}}
+    )
+    assert service.execute_job("diary_write", {"entry": "x"})["success"] is True
+    assert (
+        service.execute_job("mcp_tool", {"name": "mempalace_add_drawer", "arguments": {}})[
+            "success"
+        ]
+        is True
+    )
+    unknown = service.execute_job("bogus_kind", {})
+    assert unknown["success"] is False
+    assert unknown["exit_code"] == 2
+
+
+def test_run_sync_structured_errors_on_sync_failures(tmp_path, monkeypatch):
+    """Covers run_sync's three exception handlers (MineAlreadyRunning, ValueError,
+    generic Exception) so a failing sync_palace returns a structured error instead
+    of propagating."""
+    import mempalace.sync as sync_module
+    from mempalace import service
+    from mempalace.palace import MineAlreadyRunning
+
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    (palace / "chroma.sqlite3").touch()
+
+    def _raise(exc):
+        def fn(**kw):
+            raise exc
+
+        return fn
+
+    monkeypatch.setattr(sync_module, "sync_palace", _raise(MineAlreadyRunning("locked")))
+    r = service.run_sync({"palace_path": str(palace), "dry_run": True})
+    assert r["success"] is False
+    assert r["error_class"] == "LockHeldByOtherProcess"
+
+    monkeypatch.setattr(sync_module, "sync_palace", _raise(ValueError("bad scope")))
+    r = service.run_sync({"palace_path": str(palace), "dry_run": True})
+    assert r["success"] is False
+    assert r["exit_code"] == 2
+
+    monkeypatch.setattr(sync_module, "sync_palace", _raise(RuntimeError("boom")))
+    r = service.run_sync({"palace_path": str(palace), "dry_run": True})
+    assert r["success"] is False
+    assert "sync failed" in r["error"]

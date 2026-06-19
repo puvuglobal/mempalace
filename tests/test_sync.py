@@ -11,12 +11,6 @@ from pathlib import Path
 import chromadb
 import pytest
 
-# run_sync imports mempalace.mcp_server lazily; that import initializes the
-# embedder, which rebinds sys.stdout and defeats capsys/redirect_stdout for any
-# prints after sync_palace returns. Importing it here makes the lazy import a
-# cached no-op so the daemon-path report tests can capture run_sync's output.
-import mempalace.mcp_server  # noqa: F401
-
 
 def _seed_drawers(palace_path, repo_path, deleted_path, elsewhere_path):
     """Populate the drawers collection with 6 entries covering all buckets."""
@@ -1415,6 +1409,18 @@ class TestServiceRunSyncReport:
     formatting — opening the real Chroma collection reinitializes the embedder,
     which disturbs sys.stdout and defeats capsys.
     """
+
+    @pytest.fixture(autouse=True)
+    def _cache_mcp_server_import(self):
+        """run_sync lazily imports mempalace.mcp_server, whose import initializes
+        the embedder and rebinds sys.stdout — defeating capsys for any prints
+        after sync_palace returns. Lazy-load it here, scoped to just these report
+        tests (not the whole module at collection time), so the import is a cached
+        no-op by the time run_sync runs and its report output stays capturable.
+        """
+        import mempalace.mcp_server  # noqa: F401
+
+        yield
 
     def _fake_report(self, **overrides):
         report = {

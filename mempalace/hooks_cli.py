@@ -545,7 +545,7 @@ def _submit_daemon_job(
     kind: str,
     payload: dict,
     *,
-    dedupe_key: str | None = None,
+    dedupe_key: str = None,
     priority: int = 0,
     wait: bool = False,
     timeout: float = 60.0,

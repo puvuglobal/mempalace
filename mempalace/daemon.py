@@ -8,6 +8,7 @@ execution.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import secrets
@@ -173,10 +174,26 @@ class QueueStore:
         self._lock = threading.RLock()
         self._init_db()
 
+    @contextlib.contextmanager
     def _connect(self):
+        """Open a short-lived sqlite3 connection and close it on exit.
+
+        The bare ``with sqlite3.connect(...)`` context manager only manages the
+        transaction (commit/rollback) — it does NOT close the connection, so every
+        QueueStore call in this long-lived daemon process leaked a connection FD.
+        In a daemon that runs thousands of jobs that is an unbounded FD leak. This
+        wrapper closes the connection on exit so each call is self-contained.
+        """
         conn = sqlite3.connect(str(self.path), timeout=30)
-        conn.row_factory = sqlite3.Row
-        return conn
+        try:
+            conn.row_factory = sqlite3.Row
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
 
     def _init_db(self) -> None:
         with self._connect() as conn:
@@ -375,13 +392,21 @@ class QueueStore:
         state: str,
         result: dict[str, Any] | None = None,
         error: dict[str, Any] | None = None,
+        only_if_running: bool = False,
     ) -> Job:
+        # ``only_if_running`` guards the worker's finish against a lost race with
+        # shutdown's cancel: if the active job was already flipped to 'cancelled'
+        # by _drain_and_cleanup, a late worker finish must NOT overwrite it back to
+        # 'succeeded'/'failed' (which would un-cancel a job recover_running must
+        # not re-run). The conditional UPDATE makes the worker's finish a no-op in
+        # that window instead of relying on process-exit timing.
+        where = "WHERE id = ?" + (" AND state = 'running'" if only_if_running else "")
         with self._lock, self._connect() as conn:
             conn.execute(
-                """
+                f"""
                 UPDATE jobs
                 SET state = ?, finished_at = ?, result_json = ?, error_json = ?
-                WHERE id = ?
+                {where}
                 """,
                 (
                     state,
@@ -490,7 +515,9 @@ class DaemonRuntime:
 
     def _safe_finish(self, job_id: str, *, state: str, result: dict, error: dict | None) -> None:
         try:
-            self.store.finish(job_id, state=state, result=result, error=error)
+            # only_if_running: if shutdown already cancelled this job, don't
+            # resurrect it. A finish failure must not kill the worker regardless.
+            self.store.finish(job_id, state=state, result=result, error=error, only_if_running=True)
         except Exception:  # noqa: BLE001 - a finish failure must not kill the worker
             pass
 
@@ -783,7 +810,15 @@ class DaemonClient:
             raise DaemonError(str(payload.get("error", exc))) from exc
         except OSError as exc:
             raise DaemonError(str(exc)) from exc
-        return json.loads(raw) if raw else {}
+        if not raw:
+            return {}
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError as exc:
+            # A 2xx response with a non-JSON body (empty 200, truncated write,
+            # proxy HTML) shouldn't surface as a bare JSONDecodeError to callers
+            # that only know how to handle DaemonError.
+            raise DaemonError(f"daemon returned non-JSON response: {raw[:200]!r}") from exc
 
     def health(self) -> dict[str, Any]:
         return self.request("GET", "/health")
