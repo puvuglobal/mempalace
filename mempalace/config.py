@@ -645,6 +645,37 @@ class MempalaceConfig:
             return env_val.strip().lower()
         return str(self._file_config.get("embedding_model", "minilm")).strip().lower()
 
+    @property
+    def embedding_threads(self) -> int:
+        """Cap on the embedder's ONNX Runtime intra-op thread pool (#1068).
+
+        ChromaDB's ONNX embedder builds its ``InferenceSession`` with no thread
+        cap, so the intra-op pool defaults to the physical core count and a
+        background ``mine`` pins every core — stacked Stop-hook fires turn into
+        thermal events. ``OMP_NUM_THREADS`` is inert here (ORT owns its own
+        pool), so the cap is applied via ``SessionOptions`` in
+        :mod:`mempalace.embedding`.
+
+        Read from env ``MEMPALACE_EMBEDDING_THREADS`` first, then
+        ``embedding_threads`` in ``config.json``. Semantics:
+
+        - unset / ``"auto"`` → half the logical CPUs (min 1), so a background
+          mine leaves the machine usable out of the box.
+        - a positive integer → exactly that many intra-op threads.
+        - ``0`` or negative → uncapped: ORT's default (physical core count),
+          for users who want maximum indexing throughput.
+        """
+        raw = os.environ.get("MEMPALACE_EMBEDDING_THREADS")
+        if raw is None:
+            raw = self._file_config.get("embedding_threads")
+        if raw is None or str(raw).strip().lower() in ("", "auto"):
+            return max(1, (os.cpu_count() or 2) // 2)
+        try:
+            val = int(str(raw).strip())
+        except (TypeError, ValueError):
+            return max(1, (os.cpu_count() or 2) // 2)
+        return val if val > 0 else 0
+
     def set_embedding_model(self, model: str) -> None:
         """Persist the embedding-model choice to ``config.json``.
 

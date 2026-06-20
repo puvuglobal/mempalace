@@ -100,6 +100,54 @@ def test_embedding_device_env_overrides_config(tmp_path, monkeypatch):
     assert cfg.embedding_device == "coreml"
 
 
+def test_embedding_threads_defaults_to_half_cpus(monkeypatch):
+    monkeypatch.delenv("MEMPALACE_EMBEDDING_THREADS", raising=False)
+    monkeypatch.setattr("os.cpu_count", lambda: 10)
+    cfg = MempalaceConfig(config_dir=tempfile.mkdtemp())
+    # unset / "auto" → half the logical CPUs so a background mine stays tame
+    assert cfg.embedding_threads == 5
+
+
+def test_embedding_threads_auto_keyword(tmp_path, monkeypatch):
+    monkeypatch.delenv("MEMPALACE_EMBEDDING_THREADS", raising=False)
+    monkeypatch.setattr("os.cpu_count", lambda: 8)
+    with open(tmp_path / "config.json", "w") as f:
+        json.dump({"embedding_threads": "auto"}, f)
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.embedding_threads == 4
+
+
+def test_embedding_threads_positive_value_from_config(tmp_path, monkeypatch):
+    monkeypatch.delenv("MEMPALACE_EMBEDDING_THREADS", raising=False)
+    with open(tmp_path / "config.json", "w") as f:
+        json.dump({"embedding_threads": 3}, f)
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.embedding_threads == 3
+
+
+def test_embedding_threads_zero_means_uncapped(tmp_path, monkeypatch):
+    monkeypatch.delenv("MEMPALACE_EMBEDDING_THREADS", raising=False)
+    with open(tmp_path / "config.json", "w") as f:
+        json.dump({"embedding_threads": 0}, f)
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.embedding_threads == 0
+
+
+def test_embedding_threads_env_overrides_config(tmp_path, monkeypatch):
+    with open(tmp_path / "config.json", "w") as f:
+        json.dump({"embedding_threads": 2}, f)
+    monkeypatch.setenv("MEMPALACE_EMBEDDING_THREADS", "6")
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.embedding_threads == 6
+
+
+def test_embedding_threads_invalid_falls_back_to_auto(tmp_path, monkeypatch):
+    monkeypatch.setattr("os.cpu_count", lambda: 4)
+    monkeypatch.setenv("MEMPALACE_EMBEDDING_THREADS", "not-a-number")
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.embedding_threads == 2
+
+
 def test_env_override():
     raw = "/env/palace"
     os.environ["MEMPALACE_PALACE_PATH"] = raw
