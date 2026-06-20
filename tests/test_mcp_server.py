@@ -902,8 +902,9 @@ class TestReadTools:
     ):
         """graph_stats must aggregate from sqlite without paging metadata
         through build_graph()/HNSW (#1379). Mirrors the build_graph parity
-        case in test_palace_graph; the tripwire on graph_stats fails loudly if
-        the fast path regresses to the slow client build."""
+        case in test_palace_graph. Tripwires fail loudly if the fast path
+        regresses: graph_stats() (the slow client build) and _get_collection()
+        (any client/HNSW open) must never be reached."""
         collection.add(
             ids=["d_db_code", "d_db_proj", "d_auth", "d_general", "d_orphan"],
             documents=[
@@ -927,7 +928,11 @@ class TestReadTools:
         def _boom(*_a, **_k):
             raise AssertionError("build_graph client path used instead of sqlite fast path")
 
+        def _no_client_open(*_a, **_k):
+            raise AssertionError("chroma collection opened — fast path must avoid HNSW")
+
         monkeypatch.setattr(mcp_server, "graph_stats", _boom)
+        monkeypatch.setattr(mcp_server, "_get_collection", _no_client_open)
 
         stats = mcp_server.tool_graph_stats()
         # "general" room and the wing-less drawer are excluded, matching

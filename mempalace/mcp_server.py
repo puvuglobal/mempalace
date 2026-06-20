@@ -1036,10 +1036,16 @@ def _sqlite_graph_stats():
     import sqlite3 as _sqlite3
     from collections import Counter, defaultdict
 
+    if not _config.palace_path:
+        return None
     db_path = os.path.join(_config.palace_path, "chroma.sqlite3")
     if not os.path.isfile(db_path):
         return None
     collection_name = _config.collection_name
+    # Treat any failure as a soft fallback to the client path (sqlite errors,
+    # but also an unexpected schema shape tripping the reconstruction) so
+    # graph_stats degrades to build_graph() rather than raising — mirroring the
+    # sibling sqlite fast paths (_sqlite_taxonomy / _sqlite_wing_room_counts).
     try:
         conn = _sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
         try:
@@ -1074,54 +1080,56 @@ def _sqlite_graph_stats():
             ).fetchall()
         finally:
             conn.close()
-    except _sqlite3.Error:
+
+        # Reconstruct build_graph()'s room_data, applying its per-drawer filter
+        # (`if room and room != "general" and wing`).
+        room_data = defaultdict(lambda: {"wings": set(), "halls": set(), "count": 0})
+        for room, wing, hall, n in rows:
+            if not room or room == "general" or not wing:
+                continue
+            node = room_data[room]
+            node["wings"].add(wing)
+            if hall:
+                node["halls"].add(hall)
+            node["count"] += int(n)
+
+        tunnel_rooms = 0
+        total_edges = 0
+        wing_counts = Counter()
+        for data in room_data.values():
+            n_wings = len(data["wings"])
+            for wing in data["wings"]:
+                wing_counts[wing] += 1
+            if n_wings >= 2:
+                tunnel_rooms += 1
+                # Edges per multi-wing room: one per wing-pair per hall, matching
+                # build_graph's nested wa<wb × hall expansion.
+                total_edges += (n_wings * (n_wings - 1) // 2) * len(data["halls"])
+
+        top_tunnels = [
+            {"room": room, "wings": sorted(data["wings"]), "count": data["count"]}
+            # build_graph's graph_stats slices the top 10 by wing-count first,
+            # then keeps the multi-wing ones. An explicit room-name tiebreaker
+            # keeps the fast path deterministic across runs — preferable to
+            # leaning on SQLite's unspecified GROUP BY order. (Exact membership
+            # parity with the client path is unattainable anyway; the two never
+            # run on the same palace, since the backend picks one.)
+            for room, data in sorted(
+                room_data.items(), key=lambda kv: (-len(kv[1]["wings"]), kv[0])
+            )[:10]
+            if len(data["wings"]) >= 2
+        ]
+
+        return {
+            "total_rooms": len(room_data),
+            "tunnel_rooms": tunnel_rooms,
+            "total_edges": total_edges,
+            "rooms_per_wing": dict(wing_counts.most_common()),
+            "top_tunnels": top_tunnels,
+        }
+    except Exception:
         logger.debug("sqlite graph_stats fast path failed; falling back", exc_info=True)
         return None
-
-    # Reconstruct build_graph()'s room_data, applying its per-drawer filter
-    # (`if room and room != "general" and wing`).
-    room_data = defaultdict(lambda: {"wings": set(), "halls": set(), "count": 0})
-    for room, wing, hall, n in rows:
-        if not room or room == "general" or not wing:
-            continue
-        node = room_data[room]
-        node["wings"].add(wing)
-        if hall:
-            node["halls"].add(hall)
-        node["count"] += int(n)
-
-    tunnel_rooms = 0
-    total_edges = 0
-    wing_counts = Counter()
-    for data in room_data.values():
-        n_wings = len(data["wings"])
-        for wing in data["wings"]:
-            wing_counts[wing] += 1
-        if n_wings >= 2:
-            tunnel_rooms += 1
-            # Edges per multi-wing room: one per wing-pair per hall, matching
-            # build_graph's nested wa<wb × hall expansion.
-            total_edges += (n_wings * (n_wings - 1) // 2) * len(data["halls"])
-
-    top_tunnels = [
-        {"room": room, "wings": sorted(data["wings"]), "count": data["count"]}
-        # build_graph's graph_stats slices the top 10 by wing-count first, then
-        # keeps the multi-wing ones. Secondary sort by room name keeps the
-        # fast-path order deterministic (the client path's tie order follows
-        # dict-insertion order, which sqlite grouping can't reproduce).
-        for room, data in sorted(room_data.items(), key=lambda kv: (-len(kv[1]["wings"]), kv[0]))[
-            :10
-        ]
-        if len(data["wings"]) >= 2
-    ]
-
-    return {
-        "total_rooms": len(room_data),
-        "tunnel_rooms": tunnel_rooms,
-        "total_edges": total_edges,
-        "rooms_per_wing": dict(wing_counts.most_common()),
-        "top_tunnels": top_tunnels,
-    }
 
 
 def tool_status():
