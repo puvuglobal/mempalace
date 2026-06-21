@@ -25,7 +25,7 @@ PALACE_ROOT = Path.home() / ".mempalace"
 
 
 def _detached_popen_kwargs() -> dict:
-    """Kwargs that fully detach a Popen child so the hook process can exit.
+    """Kwargs that give a Popen child a hidden console so the hook can exit.
 
     Without these, Windows holds the parent open until the child closes the
     inherited stdout/stderr handles — manifesting as "Stop hook hangs" at
@@ -36,7 +36,7 @@ def _detached_popen_kwargs() -> dict:
     kwargs: dict = {"stdin": subprocess.DEVNULL, "close_fds": True}
     if os.name == "nt":
         flags = 0
-        for name in ("DETACHED_PROCESS", "CREATE_NEW_PROCESS_GROUP", "CREATE_BREAKAWAY_FROM_JOB"):
+        for name in ("CREATE_NO_WINDOW", "CREATE_NEW_PROCESS_GROUP", "CREATE_BREAKAWAY_FROM_JOB"):
             flags |= getattr(subprocess, name, 0)
         if flags:
             kwargs["creationflags"] = flags

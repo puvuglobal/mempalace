@@ -1035,17 +1035,26 @@ def test_detached_popen_kwargs_posix(monkeypatch):
 
 
 def test_detached_popen_kwargs_windows(monkeypatch):
-    """On Windows, kwargs include creationflags that fully detach the child.
+    """On Windows, the miner child gets a hidden console (CREATE_NO_WINDOW),
+    not a detached/no-console child (DETACHED_PROCESS).
 
-    Without these, the parent hook hangs at session end on Windows because
-    the child's inherited stdout/stderr handles keep the parent's exit
-    blocked (#1268 root cause for the Python hook path).
+    DETACHED_PROCESS gave the child no console at all, which caused any
+    console grandchild it spawned to allocate a fresh *visible* window
+    (#1783). CREATE_NO_WINDOW gives a real-but-invisible console that all
+    descendants inherit, so nothing flashes — while still fixing the
+    #1268 hang (stdin=DEVNULL, close_fds, explicit stdout/stderr redirect,
+    and CREATE_NEW_PROCESS_GROUP for the signal boundary are unchanged).
+    Per the Win32 CreateProcess docs CREATE_NO_WINDOW is ignored when OR'd
+    with DETACHED_PROCESS, so the two must be mutually exclusive.
     """
     from mempalace.hooks_cli import _detached_popen_kwargs
 
     monkeypatch.setattr("mempalace.hooks_cli.os.name", "nt")
-    # Simulate Windows-only Popen flag constants. Patch on the imported
-    # subprocess module within hooks_cli so getattr() picks them up.
+    # Simulate Windows-only Popen flag constants on the imported subprocess
+    # module so getattr() picks them up cross-platform.
+    monkeypatch.setattr(
+        "mempalace.hooks_cli.subprocess.CREATE_NO_WINDOW", 0x08000000, raising=False
+    )
     monkeypatch.setattr(
         "mempalace.hooks_cli.subprocess.DETACHED_PROCESS", 0x00000008, raising=False
     )
@@ -1056,7 +1065,10 @@ def test_detached_popen_kwargs_windows(monkeypatch):
     assert kwargs.get("stdin") is subprocess.DEVNULL
     assert kwargs.get("close_fds") is True
     flags = kwargs.get("creationflags", 0)
-    assert flags & 0x00000008, "DETACHED_PROCESS must be set"
+    assert flags & 0x08000000, "CREATE_NO_WINDOW must be set"
+    assert not (flags & 0x00000008), (
+        "DETACHED_PROCESS must NOT be set (it suppresses CREATE_NO_WINDOW)"
+    )
     assert flags & 0x00000200, "CREATE_NEW_PROCESS_GROUP must be set"
 
 
