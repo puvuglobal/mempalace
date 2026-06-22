@@ -15,6 +15,7 @@ Tools (read):
 Tools (write):
   mempalace_add_drawer      — file verbatim content into a wing/room
   mempalace_delete_drawer   — remove a drawer by ID
+  mempalace_delete_by_source — bulk-remove all drawers mined from one source_file
 
 Tools (maintenance):
   mempalace_reconnect       — force cache invalidation and reconnect after external writes
@@ -2505,6 +2506,158 @@ def tool_mine(
             _metadata_cache = None
 
 
+def _purge_source_closets(source_file: str, *, commit: bool) -> int:
+    """Count, and optionally delete, closets matching ``source_file`` exactly.
+
+    The closets collection is the searchable AAAK index layer; it is keyed by
+    ``source_file`` independently of the drawers collection, so a drawer-only
+    delete would strand stale index pointers at the deleted source (#1722).
+    Mirrors the closet-purge step in :func:`mempalace.sync.sync_palace` and the
+    re-mine purge in :func:`mempalace.palace.purge_file_closets`.
+
+    Best-effort: a missing or unavailable closet collection yields 0 and never
+    raises, so it can never abort a drawer delete that has already committed.
+    Deletion is pushed down via ``delete(where=...)`` so it survives palaces
+    larger than the 10k ``get()`` truncation; the returned count is the (best
+    effort) number of matching closets observed before the delete.
+    """
+    from .palace import get_closets_collection
+
+    try:
+        closets_col = get_closets_collection(_config.palace_path, create=False)
+    except Exception as exc:
+        logger.warning("Closet purge skipped (collection unavailable): %s", exc)
+        return 0
+    if closets_col is None:
+        return 0
+    try:
+        ids = closets_col.get(where={"source_file": source_file}, include=[]).get("ids") or []
+        count = len(ids)
+        if commit and count:
+            closets_col.delete(where={"source_file": source_file})
+        return count
+    except Exception as exc:
+        logger.warning("Closet purge failed for %s: %s", source_file, exc)
+        return 0
+
+
+def tool_delete_by_source(source_file: str, dry_run: bool = True):
+    """Delete every drawer whose ``source_file`` metadata matches exactly.
+
+    Bulk cleanup for the contamination case in #1722, where benchmark/eval
+    files (ShareGPT dumps, ``results_mempal_*.jsonl``, language config JSON)
+    get mined into the same wing as real user data and drown out semantic
+    search. Previously the only recourse was hand-rolled SQLite ``DELETE``
+    against ``chroma.sqlite3``.
+
+    Matching is exact on the stored ``source_file`` value and pushed down to
+    the backend via ``delete(where=...)`` — the same idiom used by the miner
+    and diary ingest paths — so there is no client-side id list and the
+    SQLite "too many variables" limit cannot be hit, regardless of how many
+    drawers share the source (the reporter had 55k).
+
+    Also purges the matching closets (the AAAK index layer) so deleting the
+    drawers doesn't strand stale index pointers at the dead source (#1722).
+
+    Defaults to a dry run: it reports the drawer match count, the closet match
+    count, and a small sample so the caller can confirm the blast radius before
+    anything is removed. Pass ``dry_run=False`` to commit the deletion
+    (irreversible).
+    """
+    global _metadata_cache
+    if not isinstance(source_file, str) or not source_file.strip():
+        return {"success": False, "error": "source_file must be a non-empty string"}
+    # Mirror the ingestion-side normalization (tool_add_drawer strips lone
+    # surrogates from source_file before storing) so exact matching still hits
+    # rows mined from non-ASCII paths that arrived via a cp1252 stdin (#1488).
+    source_file = strip_lone_surrogates(source_file)
+
+    col = _get_collection()
+    if not col:
+        return _collection_error_or_no_palace()
+
+    where = {"source_file": source_file}
+    try:
+        # Paginated to survive palaces larger than the 10k get() truncation.
+        metas = _fetch_all_metadata(col, where=where)
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+    match_count = len(metas)
+    # Distinct (wing, room) pairs so the caller sees where the hits live.
+    sample = []
+    seen = set()
+    for meta in metas:
+        meta = _safe_meta(meta)
+        # Default missing wing/room to "" for consistency with the rest of the
+        # file (drawers are always stored with both, but be defensive).
+        wing = meta.get("wing", "")
+        room = meta.get("room", "")
+        key = (wing, room)
+        if key in seen:
+            continue
+        seen.add(key)
+        sample.append({"wing": wing, "room": room})
+        if len(sample) >= 5:
+            break
+
+    if dry_run:
+        closet_match_count = _purge_source_closets(source_file, commit=False)
+        return {
+            "success": True,
+            "dry_run": True,
+            "source_file": source_file,
+            "match_count": match_count,
+            "closet_match_count": closet_match_count,
+            "sample": sample,
+            "hint": (
+                "No drawers were deleted. Re-run with dry_run=false to remove "
+                f"these {match_count} drawer(s) and {closet_match_count} index "
+                "entr(y/ies)."
+                if match_count
+                else "No drawers match this source_file."
+            ),
+        }
+
+    if match_count == 0:
+        # Idempotent: deleting an absent source is a no-op, not an error.
+        return {
+            "success": True,
+            "dry_run": False,
+            "source_file": source_file,
+            "deleted": 0,
+        }
+
+    _wal_log(
+        "delete_by_source",
+        {"source_file": source_file, "match_count": match_count, "sample": sample},
+    )
+    try:
+        col.delete(where=where)
+        _metadata_cache = None
+        # Purge the matching closets too so the AAAK index doesn't keep stale
+        # pointers at the now-deleted drawers (#1722). Done after the drawer
+        # delete and intentionally best-effort: the drawers are already gone,
+        # so a closet-purge hiccup must not turn a successful delete into an
+        # error — it just leaves index cruft a later `repair` / re-mine clears.
+        closets_deleted = _purge_source_closets(source_file, commit=True)
+        logger.info(
+            "Deleted %d drawer(s) and %d closet(s) from source: %s",
+            match_count,
+            closets_deleted,
+            source_file,
+        )
+        return {
+            "success": True,
+            "dry_run": False,
+            "source_file": source_file,
+            "deleted": match_count,
+            "closets_deleted": closets_deleted,
+        }
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
 def tool_sync(project_dir: str = None, wing: str = None, apply: bool = False):
     """Prune drawers whose source files are gitignored, missing, or moved (#1252)."""
     global _metadata_cache
@@ -3763,6 +3916,24 @@ TOOLS = {
             "required": ["source"],
         },
         "handler": tool_mine,
+    },
+    "mempalace_delete_by_source": {
+        "description": "Bulk-delete every drawer mined from one source_file (exact match). Use to clean up benchmark/test data accidentally mined into a user wing (#1722). Returns a dry-run match count and sample by default; pass dry_run=false to commit. Irreversible.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "source_file": {
+                    "type": "string",
+                    "description": "Exact source_file metadata value to remove (e.g. the full path that was mined)",
+                },
+                "dry_run": {
+                    "type": "boolean",
+                    "description": "Preview the match count without deleting; default true. Pass false to actually delete.",
+                },
+            },
+            "required": ["source_file"],
+        },
+        "handler": tool_delete_by_source,
     },
     "mempalace_sync": {
         "description": "Prune drawers whose source files are gitignored, deleted, or moved. Returns dry-run report by default; pass apply=true to commit deletions.",

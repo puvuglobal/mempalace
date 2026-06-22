@@ -2235,6 +2235,194 @@ def test_update_drawer_chunked_logical_id_rewrites_group(monkeypatch, config, pa
     assert listed["drawers"][0]["drawer_id"] == logical_id
 
 
+# ── Delete by source (#1722) ────────────────────────────────────────────
+
+
+class TestDeleteBySource:
+    """``tool_delete_by_source`` — bulk cleanup of benchmark/test contamination (#1722)."""
+
+    def _seed(self, monkeypatch, config, palace_path, kg):
+        _patch_mcp_server(monkeypatch, config, kg)
+        _client, _col = _get_collection(palace_path, create=True)
+        del _client
+        from mempalace.mcp_server import tool_add_drawer
+
+        # Two drawers from a "benchmark" source, one from real user data.
+        tool_add_drawer(
+            wing="bench",
+            room="general",
+            content="ShareGPT yoga retreat conversation noise number one.",
+            source_file="results_mempal_hybrid_v4_session_1.jsonl",
+        )
+        tool_add_drawer(
+            wing="bench",
+            room="general",
+            content="ShareGPT coding job description noise number two.",
+            source_file="results_mempal_hybrid_v4_session_1.jsonl",
+        )
+        tool_add_drawer(
+            wing="clients",
+            room="webdesign",
+            content="GG Sauna Dachdecker real client memory that must survive.",
+            source_file="notes/clients.md",
+        )
+
+    def _seed_closets(self, palace_path):
+        """Seed the AAAK index (closets) directly.
+
+        ``tool_add_drawer`` never builds closets — those are a miner-side
+        artifact — so to exercise the closet purge we add them straight to the
+        collection, keyed by the same ``source_file`` the drawers use: two for
+        the benchmark source, one for the real-client source.
+        """
+        from mempalace.palace import get_closets_collection
+
+        closets_col = get_closets_collection(palace_path, create=True)
+        closets_col.add(
+            ids=["bench_closet_01", "bench_closet_02", "client_closet_01"],
+            documents=[
+                "topic: yoga retreat | coding job",
+                "topic: more bench noise",
+                "topic: GG Sauna client",
+            ],
+            metadatas=[
+                {"source_file": "results_mempal_hybrid_v4_session_1.jsonl"},
+                {"source_file": "results_mempal_hybrid_v4_session_1.jsonl"},
+                {"source_file": "notes/clients.md"},
+            ],
+        )
+        return closets_col
+
+    def test_dry_run_reports_count_without_deleting(self, monkeypatch, config, palace_path, kg):
+        self._seed(monkeypatch, config, palace_path, kg)
+        from mempalace.mcp_server import tool_delete_by_source, tool_status
+
+        result = tool_delete_by_source("results_mempal_hybrid_v4_session_1.jsonl")
+        assert result["success"] is True
+        assert result["dry_run"] is True
+        assert result["match_count"] == 2
+        assert {"wing": "bench", "room": "general"} in result["sample"]
+        # Nothing removed — all three drawers still present.
+        assert tool_status()["total_drawers"] == 3
+
+    def test_dry_run_reports_closet_match_count(self, monkeypatch, config, palace_path, kg):
+        """Dry run surfaces the closet blast radius (#1722) without deleting."""
+        self._seed(monkeypatch, config, palace_path, kg)
+        closets_col = self._seed_closets(palace_path)
+        from mempalace.mcp_server import tool_delete_by_source
+
+        result = tool_delete_by_source("results_mempal_hybrid_v4_session_1.jsonl")
+        assert result["dry_run"] is True
+        assert result["closet_match_count"] == 2
+        # Nothing removed — all three closets still present.
+        assert len(closets_col.get(include=[])["ids"]) == 3
+
+    def test_commit_deletes_only_matching_source(self, monkeypatch, config, palace_path, kg):
+        self._seed(monkeypatch, config, palace_path, kg)
+        from mempalace.mcp_server import tool_delete_by_source, tool_status
+
+        result = tool_delete_by_source("results_mempal_hybrid_v4_session_1.jsonl", dry_run=False)
+        assert result["success"] is True
+        assert result["dry_run"] is False
+        assert result["deleted"] == 2
+        # Only the real client drawer remains.
+        assert tool_status()["total_drawers"] == 1
+
+    def test_commit_purges_matching_closets(self, monkeypatch, config, palace_path, kg):
+        """Deleting by source purges the matching closets too, so the AAAK
+        index keeps no stale pointers at the now-deleted drawers (#1722)."""
+        self._seed(monkeypatch, config, palace_path, kg)
+        closets_col = self._seed_closets(palace_path)
+        from mempalace.mcp_server import tool_delete_by_source
+
+        result = tool_delete_by_source("results_mempal_hybrid_v4_session_1.jsonl", dry_run=False)
+        assert result["success"] is True
+        assert result["deleted"] == 2
+        assert result["closets_deleted"] == 2
+        # The two benchmark closets are gone; the real-client closet survives.
+        remaining = closets_col.get(include=["metadatas"])
+        sources = {m["source_file"] for m in remaining["metadatas"]}
+        assert sources == {"notes/clients.md"}
+
+    def test_no_match_is_idempotent_not_error(self, monkeypatch, config, palace_path, kg):
+        self._seed(monkeypatch, config, palace_path, kg)
+        from mempalace.mcp_server import tool_delete_by_source, tool_status
+
+        result = tool_delete_by_source("does/not/exist.jsonl", dry_run=False)
+        assert result["success"] is True
+        assert result["deleted"] == 0
+        assert tool_status()["total_drawers"] == 3
+
+    def test_empty_source_file_rejected(self, monkeypatch, config, palace_path, kg):
+        self._seed(monkeypatch, config, palace_path, kg)
+        from mempalace.mcp_server import tool_delete_by_source
+
+        result = tool_delete_by_source("   ", dry_run=False)
+        assert result["success"] is False
+        assert "non-empty" in result["error"]
+
+    def test_non_string_source_rejected(self, monkeypatch, config, palace_path, kg):
+        """A non-string source_file must return a clean error, not AttributeError."""
+        self._seed(monkeypatch, config, palace_path, kg)
+        from mempalace.mcp_server import tool_delete_by_source
+
+        result = tool_delete_by_source(123, dry_run=False)
+        assert result["success"] is False
+        assert "non-empty" in result["error"]
+
+    def test_matches_after_surrogate_normalization(self, monkeypatch, config, palace_path, kg):
+        """source_file is stripped of lone surrogates on both ingest and delete,
+        so a path that arrived via a cp1252 stdin (#1488) still matches."""
+        _patch_mcp_server(monkeypatch, config, kg)
+        _client, _col = _get_collection(palace_path, create=True)
+        del _client
+        from mempalace.mcp_server import (
+            tool_add_drawer,
+            tool_delete_by_source,
+            tool_status,
+        )
+
+        # Lone low surrogate embedded in the path — add_drawer strips it.
+        raw_source = "noise\udce9_data.jsonl"
+        tool_add_drawer(
+            wing="bench",
+            room="general",
+            content="benchmark noise from a non-ASCII path",
+            source_file=raw_source,
+        )
+        assert tool_status()["total_drawers"] == 1
+
+        # Deleting with the same raw (un-stripped) string must still match.
+        result = tool_delete_by_source(raw_source, dry_run=False)
+        assert result["success"] is True
+        assert result["deleted"] == 1
+        assert tool_status()["total_drawers"] == 0
+
+    def test_registered_and_dispatchable(self, monkeypatch, config, palace_path, kg):
+        self._seed(monkeypatch, config, palace_path, kg)
+        from mempalace.mcp_server import handle_request
+
+        # Listed in tools/list
+        listed = handle_request({"method": "tools/list", "id": 1, "params": {}})
+        names = {t["name"] for t in listed["result"]["tools"]}
+        assert "mempalace_delete_by_source" in names
+
+        # Dispatches and defaults to dry-run (no destructive side effect)
+        resp = handle_request(
+            {
+                "method": "tools/call",
+                "id": 2,
+                "params": {
+                    "name": "mempalace_delete_by_source",
+                    "arguments": {"source_file": "results_mempal_hybrid_v4_session_1.jsonl"},
+                },
+            }
+        )
+        content = json.loads(resp["result"]["content"][0]["text"])
+        assert content["dry_run"] is True
+        assert content["match_count"] == 2
+
+
 # ── KG Tools ────────────────────────────────────────────────────────────
 
 

@@ -146,6 +146,20 @@ Mine a directory into the palace — the MCP equivalent of `mempalace mine`. Wra
 
 ---
 
+### `mempalace_delete_by_source`
+
+Bulk-delete every drawer mined from one `source_file` (exact match). Use this to clean up benchmark or test data that was accidentally mined into a user wing — for example ShareGPT dumps or `results_mempal_*.jsonl` eval files drowning out real memories in semantic search. Matching is pushed down to the storage backend via a `where` filter, so it is not subject to the SQLite variable limit no matter how many drawers share the source. Returns a dry-run match count and a small sample by default; pass `dry_run=false` to commit. Irreversible.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `source_file` | string | **Yes** | Exact `source_file` metadata value to remove (e.g. the full path that was mined) |
+| `dry_run` | boolean | No | Preview the match count without deleting; default `true`. Pass `false` to actually delete |
+
+**Returns (dry run):** `{ success, dry_run, source_file, match_count, sample, hint }`
+**Returns (commit):** `{ success, dry_run, source_file, deleted }`
+
+---
+
 ### `mempalace_sync`
 
 Prune drawers whose source files are gitignored, deleted, or moved. Returns a dry-run report by default; pass `apply=true` to commit deletions.
